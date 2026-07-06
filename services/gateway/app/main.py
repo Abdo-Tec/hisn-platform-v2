@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 import uuid
 import numpy as np
 from sklearn.ensemble import IsolationForest
-from app.core.rules_engine import RulesEngine
+from app.core.rules_engine import random
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("hisn-gateway")
@@ -164,10 +164,10 @@ async def init_db():
         if existing == 0:
             await conn.execute("""
                 INSERT INTO hisn.watchlist (full_name_ar, full_name_en, list_type) VALUES
-                ('أسامة بن لادن', 'Osama bin Laden', 'UN'),
-                ('أيمن الظواهري', 'Ayman al-Zawahiri', 'UN'),
-                ('أبو بكر البغدادي', 'Abu Bakr al-Baghdadi', 'UN'),
-                ('قاسم الريمي', 'Qasim al-Raymi', 'UN')
+                ('semsem 1', 'سمسم ١', 'UN'),
+                ('semsem 2', 'سمسم ٢', 'UN'),
+                ('semsem 3', 'سمسم ٣', 'UN'),
+                ('semsem 4', 'سمسم ٤', 'UN')
             """)
         tenant_exists = await conn.fetchval("SELECT COUNT(*) FROM hisn.tenants WHERE api_key = $1", "dev-api-key-12345")
         if tenant_exists == 0:
