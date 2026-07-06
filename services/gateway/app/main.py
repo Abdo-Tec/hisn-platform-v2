@@ -1,7 +1,7 @@
 """
-حِصْن API Gateway v7.2.0
+حِصْن API Gateway v7.3.0
 ========================
-النظام: مصادقة، سجل تدقيق، AML + KYC مع محرك القواعد.
+النظام: مصادقة، سجل تدقيق، AML، KYC، KYB مع محرك القواعد.
 """
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Depends
@@ -21,7 +21,7 @@ import random
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("hisn-gateway")
 
-app = FastAPI(title="Hisn Platform Gateway", version="7.2.0")
+app = FastAPI(title="Hisn Platform Gateway", version="7.3.0")
 
 DB_POOL = None
 
@@ -104,7 +104,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 async def startup():
     await get_db_pool()
     await init_db()
-    await audit_log("system_startup", "system", "Gateway v7.2.0 started with AML and KYC")
+    await audit_log("system_startup", "system", "Gateway v7.3.0 started with AML, KYC, KYB")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -167,6 +167,16 @@ async def init_db():
                 response_details TEXT,
                 created_at TIMESTAMP DEFAULT NOW()
             );
+            CREATE TABLE IF NOT EXISTS hisn.kyb_requests (
+                id SERIAL PRIMARY KEY,
+                request_id VARCHAR(50) UNIQUE NOT NULL,
+                company_name VARCHAR(500),
+                commercial_reg VARCHAR(255),
+                status VARCHAR(50) DEFAULT 'pending',
+                risk_score DECIMAL(5,2) DEFAULT 0.0,
+                response_details TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
         """)
         # بيانات أولية
         existing = await conn.fetchval("SELECT COUNT(*) FROM hisn.watchlist")
@@ -181,7 +191,7 @@ async def init_db():
         tenant_exists = await conn.fetchval("SELECT COUNT(*) FROM hisn.tenants WHERE api_key = $1", "dev-api-key-12345")
         if tenant_exists == 0:
             await conn.execute("INSERT INTO hisn.tenants (name, api_key) VALUES ($1, $2)", "Default Tenant", "dev-api-key-12345")
-    logger.info("✅ قاعدة البيانات جاهزة (جداول AML + KYC)")
+    logger.info("✅ قاعدة البيانات جاهزة (AML + KYC + KYB)")
 
 # -------------------------------
 # نماذج AML
@@ -222,11 +232,26 @@ class KYCResponse(BaseModel):
     details: str
 
 # -------------------------------
+# نماذج KYB
+# -------------------------------
+class KYBRequest(BaseModel):
+    company_name: str
+    commercial_reg_number: str
+    legal_entity_type: str = "LLC"
+    country_of_incorporation: str = "SA"
+
+class KYBResponse(BaseModel):
+    request_id: str
+    status: str
+    risk_score: float
+    details: str
+
+# -------------------------------
 # نقاط النهاية
 # -------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "7.2.0"}
+    return {"status": "ok", "version": "7.3.0"}
 
 @app.get("/secure/test")
 async def secure_test(tenant: dict = Depends(verify_api_key)):
@@ -352,3 +377,33 @@ async def verify_kyc(request: KYCRequest, tenant: dict = Depends(verify_api_key)
 
     await audit_log("kyc_verify", "system", f"KYC: {request.full_name}, Status: {status}, Score: {risk_score}", tenant["tenant_id"])
     return KYCResponse(request_id=request_id, status=status, risk_score=risk_score, details=details)
+
+@app.post("/kyb/verify", response_model=KYBResponse)
+async def verify_kyb(request: KYBRequest, tenant: dict = Depends(verify_api_key)):
+    request_id = f"KYB-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+    risk_score = round(random.uniform(0.0, 0.8), 2)
+    
+    if "وهمي" in request.company_name or "غير مرخص" in request.company_name:
+        status = "flagged"
+        details = "اسم الشركة مشبوه"
+        risk_score = 0.9
+    elif request.country_of_incorporation.upper() in HIGH_RISK_COUNTRIES:
+        status = "flagged"
+        details = "بلد التأسيس عالي المخاطر"
+        risk_score = 0.85
+    elif risk_score > 0.6:
+        status = "flagged"
+        details = "احتمال وجود مخالفات"
+    else:
+        status = "approved"
+        details = "التحقق من الكيان التجاري ناجح"
+
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO hisn.kyb_requests (request_id, company_name, commercial_reg, status, risk_score, response_details) VALUES ($1, $2, $3, $4, $5, $6)",
+            request_id, request.company_name, request.commercial_reg_number, status, risk_score, details
+        )
+
+    await audit_log("kyb_verify", "system", f"KYB: {request.company_name}, Status: {status}, Score: {risk_score}", tenant["tenant_id"])
+    return KYBResponse(request_id=request_id, status=status, risk_score=risk_score, details=details)
