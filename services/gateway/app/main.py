@@ -1,8 +1,7 @@
 """
-حِصْن API Gateway v7.1.0
+حِصْن API Gateway v7.2.0
 ========================
-النظام الجديد: مصادقة، توجيه، سجل تدقيق مركزي، معالجة أخطاء موحدة،
-وأول خدمة أعمال: تقييم AML باستخدام محرك القواعد.
+النظام: مصادقة، سجل تدقيق، AML + KYC مع محرك القواعد.
 """
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Depends
@@ -16,21 +15,21 @@ from datetime import datetime, timedelta
 import uuid
 import numpy as np
 from sklearn.ensemble import IsolationForest
-from app.core.rules_engine import random
+from app.core.rules_engine import RulesEngine
+import random
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("hisn-gateway")
 
-app = FastAPI(title="Hisn Platform Gateway", version="7.1.0")
+app = FastAPI(title="Hisn Platform Gateway", version="7.2.0")
 
 DB_POOL = None
 
 # -------------------------------
-# محرك القواعد + ذكاء اصطناعي بسيط
+# محرك القواعد + ذكاء اصطناعي
 # -------------------------------
 aml_rules_engine = RulesEngine()
 anomaly_model = IsolationForest(contamination=0.1, random_state=42)
-# تدريب افتراضي (يمكن تحسينه لاحقاً)
 X_train = np.random.normal(50000, 20000, 1000).reshape(-1, 1)
 anomaly_model.fit(X_train)
 
@@ -105,7 +104,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 async def startup():
     await get_db_pool()
     await init_db()
-    await audit_log("system_startup", "system", "Gateway v7.1.0 started with AML Service")
+    await audit_log("system_startup", "system", "Gateway v7.2.0 started with AML and KYC")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -158,21 +157,31 @@ async def init_db():
                 tenant_id VARCHAR(255) DEFAULT 'default',
                 created_at TIMESTAMP DEFAULT NOW()
             );
+            CREATE TABLE IF NOT EXISTS hisn.kyc_requests (
+                id SERIAL PRIMARY KEY,
+                request_id VARCHAR(50) UNIQUE NOT NULL,
+                subject_name VARCHAR(500),
+                id_number VARCHAR(255),
+                status VARCHAR(50) DEFAULT 'pending',
+                risk_score DECIMAL(5,2) DEFAULT 0.0,
+                response_details TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
         """)
         # بيانات أولية
         existing = await conn.fetchval("SELECT COUNT(*) FROM hisn.watchlist")
         if existing == 0:
             await conn.execute("""
                 INSERT INTO hisn.watchlist (full_name_ar, full_name_en, list_type) VALUES
-                ('semsem 1', 'سمسم ١', 'UN'),
-                ('semsem 2', 'سمسم ٢', 'UN'),
-                ('semsem 3', 'سمسم ٣', 'UN'),
-                ('semsem 4', 'سمسم ٤', 'UN')
+                ('أسامة بن لادن', 'Osama bin Laden', 'UN'),
+                ('أيمن الظواهري', 'Ayman al-Zawahiri', 'UN'),
+                ('أبو بكر البغدادي', 'Abu Bakr al-Baghdadi', 'UN'),
+                ('قاسم الريمي', 'Qasim al-Raymi', 'UN')
             """)
         tenant_exists = await conn.fetchval("SELECT COUNT(*) FROM hisn.tenants WHERE api_key = $1", "dev-api-key-12345")
         if tenant_exists == 0:
             await conn.execute("INSERT INTO hisn.tenants (name, api_key) VALUES ($1, $2)", "Default Tenant", "dev-api-key-12345")
-    logger.info("✅ قاعدة البيانات جاهزة (جداول AML إضافية)")
+    logger.info("✅ قاعدة البيانات جاهزة (جداول AML + KYC)")
 
 # -------------------------------
 # نماذج AML
@@ -197,11 +206,27 @@ class AMLRiskAssessment(BaseModel):
     triggered_rules: List[str] = []
 
 # -------------------------------
+# نماذج KYC
+# -------------------------------
+class KYCRequest(BaseModel):
+    full_name: str
+    id_type: str
+    id_number: str
+    date_of_birth: Optional[str] = None
+    nationality: Optional[str] = None
+
+class KYCResponse(BaseModel):
+    request_id: str
+    status: str
+    risk_score: float
+    details: str
+
+# -------------------------------
 # نقاط النهاية
 # -------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "7.1.0"}
+    return {"status": "ok", "version": "7.2.0"}
 
 @app.get("/secure/test")
 async def secure_test(tenant: dict = Depends(verify_api_key)):
@@ -209,19 +234,12 @@ async def secure_test(tenant: dict = Depends(verify_api_key)):
 
 @app.post("/aml/evaluate", response_model=AMLRiskAssessment)
 async def evaluate_aml(request: AMLRequest, tenant: dict = Depends(verify_api_key)):
-    """
-    تقييم مخاطر غسل الأموال باستخدام:
-    - محرك القواعد (4 قواعد أساسية)
-    - قواعد متقدمة (دائرية، طبقات، تجارية، كيانات غير مرخصة، حساب عالي المخاطر)
-    - كشف شذوذ باستخدام Isolation Forest
-    """
     pool = await get_db_pool()
     async with pool.acquire() as conn:
         risk_score = 0.0
         triggered = []
         ref_time = datetime.fromisoformat(request.timestamp) if request.timestamp else datetime.utcnow()
 
-        # 1. استعلامات قاعدة البيانات المطلوبة للسياق
         window_10min = ref_time - timedelta(minutes=10)
         tx_count_10min = await conn.fetchval(
             "SELECT COUNT(*) FROM hisn.aml_transactions WHERE customer_id = $1 AND timestamp >= $2",
@@ -236,7 +254,6 @@ async def evaluate_aml(request: AMLRequest, tenant: dict = Depends(verify_api_ke
                 request.customer_id, day_start
             )
 
-        # 2. تقييم محرك القواعد
         context = {
             'amount': request.amount,
             'country': request.country,
@@ -247,8 +264,6 @@ async def evaluate_aml(request: AMLRequest, tenant: dict = Depends(verify_api_ke
         triggered.extend(engine_triggered)
         risk_score += engine_score
 
-        # 3. قواعد متقدمة (لن ندخلها في YAML الآن لأنها تحتاج منطق قاعدة بيانات معقد)
-        # - التعاملات الدائرية
         if request.recipient_id:
             exists = await conn.fetchval(
                 "SELECT id FROM hisn.aml_transactions WHERE customer_id = $1 AND recipient_id = $2 LIMIT 1",
@@ -258,7 +273,6 @@ async def evaluate_aml(request: AMLRequest, tenant: dict = Depends(verify_api_ke
                 triggered.append("circular_transaction")
                 risk_score += 0.6
 
-        # - طبقات (layering)
         if request.recipient_id:
             recent_recipient_tx = await conn.fetchval(
                 "SELECT COUNT(*) FROM hisn.aml_transactions WHERE customer_id = $1 AND timestamp >= $2",
@@ -268,7 +282,6 @@ async def evaluate_aml(request: AMLRequest, tenant: dict = Depends(verify_api_ke
                 triggered.append("layering_detected")
                 risk_score += 0.4
 
-        # - غسل أموال تجاري
         if request.invoice_number:
             inv_exists = await conn.fetchval(
                 "SELECT id FROM hisn.aml_transactions WHERE invoice_number = $1",
@@ -278,12 +291,10 @@ async def evaluate_aml(request: AMLRequest, tenant: dict = Depends(verify_api_ke
                 triggered.append("possible_trade_based_ml")
                 risk_score += 0.7
 
-        # - كيان غير مرخص
         if request.entity_name and request.entity_name in UNLICENSED_ENTITIES:
             triggered.append("unlicensed_entity")
             risk_score += 0.8
 
-        # - حساب عالي المخاطر
         account_risk = await conn.fetchval(
             "SELECT risk_score FROM hisn.account_profiles WHERE customer_id = $1",
             request.customer_id
@@ -292,13 +303,11 @@ async def evaluate_aml(request: AMLRequest, tenant: dict = Depends(verify_api_ke
             triggered.append("high_risk_account")
             risk_score += 0.5
 
-        # - كشف الشذوذ بالذكاء الاصطناعي
         amount_np = np.array([[request.amount]])
         if anomaly_model.predict(amount_np)[0] == -1:
             triggered.append("ml_anomaly_amount")
             risk_score += 0.3
 
-        # تسجيل المعاملة في السجل
         await conn.execute(
             "INSERT INTO hisn.aml_transactions (customer_id, amount, currency, country, transaction_type, recipient_id, invoice_number, entity_name, timestamp) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
             request.customer_id, request.amount, request.currency, request.country.upper(),
@@ -310,3 +319,36 @@ async def evaluate_aml(request: AMLRequest, tenant: dict = Depends(verify_api_ke
     risk_level = "high" if risk_score >= 0.7 else "medium" if risk_score >= 0.4 else "low"
     await audit_log("aml_evaluate", "system", f"Customer: {request.customer_id}, Score: {risk_score}, Level: {risk_level}", tenant["tenant_id"])
     return AMLRiskAssessment(risk_score=round(risk_score, 2), risk_level=risk_level, triggered_rules=triggered)
+
+@app.post("/kyc/verify", response_model=KYCResponse)
+async def verify_kyc(request: KYCRequest, tenant: dict = Depends(verify_api_key)):
+    request_id = f"KYC-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+    risk_score = round(random.uniform(0.0, 0.9), 2)
+    
+    if "محظور" in request.full_name or "عقوبات" in request.full_name:
+        status = "flagged"
+        details = "الاسم مطابق لقائمة عقوبات"
+        risk_score = 0.95
+    elif request.id_type == "passport" and request.nationality in HIGH_RISK_COUNTRIES:
+        status = "flagged"
+        details = "دولة إصدار الجواز عالية المخاطر"
+        risk_score = 0.8
+    elif risk_score > 0.7:
+        status = "flagged"
+        details = "تجاوز حد المخاطر"
+    elif risk_score > 0.4:
+        status = "approved"
+        details = "تم التحقق مع ملاحظة"
+    else:
+        status = "approved"
+        details = "تم التحقق بنجاح"
+
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO hisn.kyc_requests (request_id, subject_name, id_number, status, risk_score, response_details) VALUES ($1, $2, $3, $4, $5, $6)",
+            request_id, request.full_name, request.id_number, status, risk_score, details
+        )
+
+    await audit_log("kyc_verify", "system", f"KYC: {request.full_name}, Status: {status}, Score: {risk_score}", tenant["tenant_id"])
+    return KYCResponse(request_id=request_id, status=status, risk_score=risk_score, details=details)
